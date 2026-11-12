@@ -256,3 +256,22 @@ hide on downward scroll via `chromeHidden` and reveal on any upward move.
   (`BrowserScreen.kt`) — omnibox with search fallback, back/forward,
   downloads via system DownloadManager, file uploads, camera/mic/geo
   permission grants, desktop mode, find-in-page, share, open in Chrome.
+
+## Hidden browser conventions (v1.2.2)
+
+- Never invoke the system browser or Custom Tabs; every link stays in the
+  in-app WebView browser so browserless devices behave identically. Non-http
+  schemes (`mailto:`, `intent:`, `market:`) are the only handoffs out.
+- WebView UA: strip `; wv` and `Version/4.0 ` (the DJI GO 4 trick) so Google
+  sign-in does not see an embedded-WebView UA. Desktop-site mode instead sends
+  a Windows Chrome UA carrying **this device's real Chromium major version**,
+  and `DESKTOP_UA_SYNC_JS` (registered via
+  `WebViewCompat.addDocumentStartJavaScript`) mirrors
+  `navigator.userAgentData` / `navigator.platform` to match it — the UA string
+  and Client Hints must never disagree, or sites like whatismybrowser flag a
+  conflict. The script self-gates on the UA, so toggling back to mobile mode
+  deactivates it with no re-registration.
+- Pull-to-refresh wraps the tabs directly: the WebView must be a **direct
+  child** of the SwipeRefreshLayout, because `canChildScrollUp()` only asks
+  the direct child — an intermediate wrapper always reports "at top" and the
+  gesture fires mid-page.

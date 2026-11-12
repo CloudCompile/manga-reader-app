@@ -84,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import androidx.webkit.WebViewCompat
 import coil.compose.AsyncImage
 import org.json.JSONArray
 import org.json.JSONObject
@@ -193,7 +194,7 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
 
     // ---- WebView pool (one live instance per tab) -------------------------------
     val webViews = remember { mutableMapOf<Long, WebView>() }
-    val containerRef = remember { mutableStateOf<FrameLayout?>(null) }
+    val containerRef = remember { mutableStateOf<ViewGroup?>(null) }
     val pullRef = remember { mutableStateOf<SwipeRefreshLayout?>(null) }
 
     // Delivers the href behind a long-pressed image link (requestFocusNodeHref).
@@ -655,11 +656,20 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
             Box(Modifier.weight(1f)) {
                 AndroidView(
                     factory = { ctx ->
+                        // The SwipeRefreshLayout hosts the tabs directly — its
+                        // canChildScrollUp() then reads the WebView's real scroll
+                        // position, so pulling only refreshes at the top of a page.
+                        // (An intermediate plain ViewGroup always reports "top",
+                        // which made pull-to-refresh fire mid-page.)
                         SwipeRefreshLayout(ctx).apply {
-                            addView(FrameLayout(ctx).also { containerRef.value = it })
+                            containerRef.value = this
                             setOnRefreshListener {
-                                tabError = tabError?.takeIf { it.first != activeIdRef.longValue }
-                                webViews[activeIdRef.longValue]?.reload()
+                                val wv = webViews[activeIdRef.longValue]
+                                if (wv == null) isRefreshing = false
+                                else {
+                                    tabError = tabError?.takeIf { it.first != activeIdRef.longValue }
+                                    wv.reload()
+                                }
                             }
                         }.also { pullRef.value = it }
                     },
@@ -1794,6 +1804,10 @@ private fun normalizeUrl(input: String): String {
 
 @SuppressLint("SetJavaScriptEnabled")
 private fun configureBrowserSettings(webView: WebView, desktop: Boolean) {
+    // The device's own WebView UA — read before anything modifies it. Its
+    // Chrome/NNN major version is reused for the desktop UA so the UA string
+    // and JS-visible Client Hints agree on one browser version.
+    val realUa = webView.settings.userAgentString
     webView.settings.apply {
         javaScriptEnabled = true
         domStorageEnabled = true
@@ -1812,14 +1826,14 @@ private fun configureBrowserSettings(webView: WebView, desktop: Boolean) {
         mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         safeBrowsingEnabled = true // malware/phishing interstitials
         userAgentString = if (desktop) {
-            DESKTOP_UA
+            desktopUserAgent(realUa)
         } else {
             // Same trick DJI GO 4's beloved hidden browser used: strip the two
             // tokens that mark this UA as an embedded WebView (`; wv` and
             // `Version/4.0`). Google's login shows "This browser or app may
             // not be secure" when it sees them; without them accounts.google.com
             // behaves as if the user were in Chrome.
-            webView.settings.userAgentString
+            realUa
                 .replace("; wv", "")
                 .replace(" wv;", "")
                 .replace("Version/4.0 ", "")
@@ -1829,10 +1843,81 @@ private fun configureBrowserSettings(webView: WebView, desktop: Boolean) {
         setAcceptCookie(true)
         setAcceptThirdPartyCookies(webView, true)
     }
+    // Desktop mode also has to agree with itself in JS: navigator.userAgentData
+    // (Client Hints) and navigator.platform otherwise keep reporting the real
+    // Android WebView, so sites like whatismybrowser flag "Chrome on Windows"
+    // in the UA string against "Chrome 145 on Android" in the Client Hints.
+    // Injected at document start, so page scripts never observe the raw
+    // values. The script no-ops unless the UA is the desktop one, so a tab
+    // toggled back to mobile mode is untouched.
+    WebViewCompat.addDocumentStartJavaScript(webView, DESKTOP_UA_SYNC_JS, setOf("*"))
 }
 
-private const val DESKTOP_UA =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+/**
+ * User-Agent for desktop-site mode: Chrome on Windows, but carrying THIS
+ * device's real Chromium major version. (The previous frozen
+ * `X11; Linux x86_64 ... Chrome/124` UA made whatismybrowser report a
+ * conflict — UA string said "Chrome on Linux", Client Hints said
+ * "Chrome 145 on Android".) Windows is the desktop profile because its
+ * Client Hints are trivially stable to mirror.
+ */
+private fun desktopUserAgent(realUa: String): String {
+    val major = Regex("""Chrome/(\d+)""").find(realUa)?.groupValues?.get(1) ?: "124"
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/$major.0.0.0 Safari/537.36"
+}
+
+/**
+ * Runs at document start (WebViewCompat.addDocumentStartJavaScript) so every
+ * JS-visible identity signal matches the desktop UA string:
+ * navigator.userAgentData (low- and high-entropy Client Hints) and
+ * navigator.platform are overridden to a Windows desktop profile derived
+ * from the UA itself. Self-gating: it only acts when the current UA is the
+ * desktop one, so tabs toggled back to mobile mode are untouched.
+ */
+private val DESKTOP_UA_SYNC_JS = """
+    (function () {
+      try {
+        var ua = navigator.userAgent;
+        if (ua.indexOf("Windows NT 10.0") === -1) return;
+        var m = ua.match(/Chrome\/(\d+)/);
+        if (!m) return;
+        var V = m[1];
+        var brands = Object.freeze([
+          Object.freeze({ brand: "Not(A:Brand", version: "99" }),
+          Object.freeze({ brand: "Chromium", version: V }),
+          Object.freeze({ brand: "Google Chrome", version: V })
+        ]);
+        var entropy = {
+          brands: brands,
+          mobile: false,
+          platform: "Windows",
+          architecture: "x86",
+          bitness: "64",
+          model: "",
+          platformVersion: "15.0.0",
+          uaFullVersion: V + ".0.0.0",
+          fullVersionList: brands
+        };
+        var uaData = {
+          brands: brands,
+          mobile: false,
+          platform: "Windows",
+          toJSON: function () { return { brands: brands, mobile: false, platform: "Windows" }; },
+          getHighEntropyValues: function (hints) {
+            var keys = Array.prototype.slice.call(hints || []);
+            var out = {};
+            for (var i = 0; i < keys.length; i++) {
+              if (Object.prototype.hasOwnProperty.call(entropy, keys[i])) out[keys[i]] = entropy[keys[i]];
+            }
+            return Promise.resolve(out);
+          }
+        };
+        Object.defineProperty(navigator, "userAgentData", { value: uaData, configurable: true, enumerable: true });
+        Object.defineProperty(navigator, "platform", { value: "Win32", configurable: true, enumerable: true });
+      } catch (e) {}
+    })();
+""".trimIndent()
 
 private const val START_URL = "https://mangareader.cjhauser.me"
 
