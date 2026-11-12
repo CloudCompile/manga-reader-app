@@ -55,3 +55,11 @@ server.log
 
 # upload mount
 upload/
+# Gradle / Android
+global-local.properties
+.gradle/
+build/
+app/build/
+local.properties
+captures/
+*.iml

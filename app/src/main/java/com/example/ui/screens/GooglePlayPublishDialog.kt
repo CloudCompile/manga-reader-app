@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -22,9 +23,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun GooglePlayPublishDialog(
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onOpenHiddenBrowser: (() -> Unit)? = null
 ) {
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -56,7 +59,12 @@ fun GooglePlayPublishDialog(
                         Text(
                             text = "Google Play Package Info",
                             style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            modifier = if (onOpenHiddenBrowser != null) {
+                                Modifier.combinedClickable(onClick = {}, onLongClick = onOpenHiddenBrowser)
+                            } else {
+                                Modifier
+                            }
                         )
                     }
                     IconButton(onClick = onDismiss) {

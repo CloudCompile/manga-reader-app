@@ -239,3 +239,20 @@ a hardcoded `text-white` disappears in light mode. `bg`, `textCol`, `subText`,
 Wide mode renders `pageGroups`, which pairs consecutive pages; the pairing is
 why page lookup in the scroll handler indexes images rather than groups. Bars
 hide on downward scroll via `chromeHidden` and reveal on any upward move.
+
+## Native app fixes (2026-11-12)
+
+- `MangaRepository` now targets the production API at
+  `https://mangareader.cjhauser.me` and uses the correct verbs:
+  `POST /api/chapters` and `POST /api/scrape` (JSON `{url}` body), `GET
+  /api/titles`, `GET /api/search?q=`. The old code used GET + query strings,
+  which 405s and broke chapter lists and reading.
+- Page images load through `/api/proxy` like the web reader (source sites
+  block direct hotlinking).
+- History and bookmarks persist in SharedPreferences (survive restarts).
+- Home search fans out to the real multi-source search endpoint.
+- **Hidden browser**: long-press the "Manga Reader" home title (or the title
+  in the Google Play dialog) to open a full in-app Chromium browser
+  (`BrowserScreen.kt`) — omnibox with search fallback, back/forward,
+  downloads via system DownloadManager, file uploads, camera/mic/geo
+  permission grants, desktop mode, find-in-page, share, open in Chrome.

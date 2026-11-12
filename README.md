@@ -193,3 +193,9 @@ npm run typecheck
 
 See [AGENTS.md](./AGENTS.md) for the architecture, the site-specific scraper
 quirks, and the release process.
+
+## Hidden in-app browser
+
+Long-press the **"Manga Reader"** title on the home screen to open a full
+built-in Chromium browser (downloads, uploads, desktop mode, find-in-page).
+There is no visible button for it by design.

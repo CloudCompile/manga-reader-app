@@ -27,6 +27,7 @@ import com.example.models.ChapterData
 import com.example.models.ChapterItem
 import com.example.models.HistoryEntry
 import com.example.models.TitleItem
+import com.example.ui.screens.BrowserScreen
 import com.example.ui.screens.GooglePlayPublishDialog
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.ReaderScreen
@@ -34,7 +35,7 @@ import com.example.ui.theme.MangaReaderTheme
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
-    private val repository = MangaRepository()
+    private val repository by lazy { MangaRepository(context = applicationContext) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,10 +47,18 @@ class MainActivity : ComponentActivity() {
             var bookmarkedUrls by remember { mutableStateOf<Set<String>>(emptySet()) }
             var history by remember { mutableStateOf<List<HistoryEntry>>(emptyList()) }
 
+            // Remote search across all sources
+            var searchResults by remember { mutableStateOf<List<TitleItem>>(emptyList()) }
+            var isSearching by remember { mutableStateOf(false) }
+            var lastQuery by remember { mutableStateOf("") }
+
             // Current reader state
             var currentChapterData by remember { mutableStateOf<ChapterData?>(null) }
             var isReaderLoading by remember { mutableStateOf(false) }
             var isReading by remember { mutableStateOf(false) }
+
+            // Hidden full in-app browser (long-press the home screen title)
+            var showBrowser by remember { mutableStateOf(false) }
 
             // Dialogs
             var showPlayDialog by remember { mutableStateOf(false) }
@@ -66,6 +75,16 @@ class MainActivity : ComponentActivity() {
                 isTitlesLoading = false
                 bookmarkedUrls = repository.getBookmarks().map { it.url }.toSet()
                 history = repository.getHistory()
+            }
+
+            fun remoteSearch(query: String) {
+                if (query == lastQuery) return
+                lastQuery = query
+                lifecycleScope.launch {
+                    isSearching = true
+                    searchResults = repository.search(query)
+                    isSearching = false
+                }
             }
 
             fun openChapter(chapterUrl: String, mangaName: String) {
@@ -103,8 +122,10 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    if (isReading) {
-                        ReaderScreen(
+                    when {
+                        showBrowser -> BrowserScreen(onClose = { showBrowser = false })
+
+                        isReading -> ReaderScreen(
                             chapterData = currentChapterData,
                             isLoading = isReaderLoading,
                             onBack = { isReading = false },
@@ -119,12 +140,15 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         )
-                    } else {
-                        HomeScreen(
+
+                        else -> HomeScreen(
                             titles = titles,
                             isLoading = isTitlesLoading,
                             onTitleClick = { openTitle(it) },
-                            onSearchClick = {},
+                            onSearch = { remoteSearch(it) },
+                            searchResults = searchResults,
+                            isSearching = isSearching,
+                            onOpenHiddenBrowser = { showBrowser = true },
                             onBookmarksClick = { showBookmarksDialog = true },
                             onHistoryClick = { showHistoryDialog = true },
                             onPlayPublishClick = { showPlayDialog = true },
@@ -138,7 +162,10 @@ class MainActivity : ComponentActivity() {
 
                     // Google Play Publishing Package Modal
                     if (showPlayDialog) {
-                        GooglePlayPublishDialog(onDismiss = { showPlayDialog = false })
+                        GooglePlayPublishDialog(
+                            onDismiss = { showPlayDialog = false },
+                            onOpenHiddenBrowser = { showBrowser = true }
+                        )
                     }
 
                     // Chapter List Bottom Sheet / Dialog
@@ -183,7 +210,7 @@ class MainActivity : ComponentActivity() {
                                             contentAlignment = Alignment.Center
                                         ) {
                                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                                Text("Opening latest chapter directly...")
+                                                Text("No chapter list — try opening the latest chapter directly.")
                                                 Spacer(modifier = Modifier.height(12.dp))
                                                 Button(onClick = {
                                                     val url = selectedTitleForChapters?.url ?: ""
@@ -289,11 +316,23 @@ class MainActivity : ComponentActivity() {
                                 color = MaterialTheme.colorScheme.surface
                             ) {
                                 Column(modifier = Modifier.padding(16.dp)) {
-                                    Text(
-                                        "Reading History",
-                                        fontWeight = FontWeight.Bold,
-                                        style = MaterialTheme.typography.titleMedium
-                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "Reading History",
+                                            fontWeight = FontWeight.Bold,
+                                            style = MaterialTheme.typography.titleMedium
+                                        )
+                                        IconButton(onClick = {
+                                            repository.clearHistory()
+                                            history = emptyList()
+                                        }) {
+                                            Icon(Icons.Default.Delete, contentDescription = "Clear history")
+                                        }
+                                    }
                                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
                                     if (history.isEmpty()) {

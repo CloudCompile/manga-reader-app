@@ -15,6 +15,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -30,7 +32,10 @@ fun HomeScreen(
     titles: List<TitleItem>,
     isLoading: Boolean,
     onTitleClick: (TitleItem) -> Unit,
-    onSearchClick: () -> Unit,
+    onSearch: (String) -> Unit,
+    searchResults: List<TitleItem>,
+    isSearching: Boolean,
+    onOpenHiddenBrowser: () -> Unit,
     onBookmarksClick: () -> Unit,
     onHistoryClick: () -> Unit,
     onPlayPublishClick: () -> Unit,
@@ -42,17 +47,25 @@ fun HomeScreen(
     var searchQuery by remember { mutableStateOf("") }
     var isSearchExpanded by remember { mutableStateOf(false) }
 
-    val filteredTitles = remember(titles, selectedTab, searchQuery) {
-        val base = if (selectedTab == 0) titles.take(15) else titles
-        if (searchQuery.isBlank()) {
-            base
+    // Debounced remote search across all sources (merged with local results).
+    LaunchedEffect(searchQuery) {
+        val q = searchQuery.trim()
+        kotlinx.coroutines.delay(400)
+        if (q.length >= 2) onSearch(q)
+    }
+
+    val filteredTitles = remember(titles, selectedTab, searchQuery, searchResults) {
+        val q = searchQuery.trim()
+        if (q.isBlank()) {
+            if (selectedTab == 0) titles.take(15) else titles
         } else {
-            val q = searchQuery.trim().lowercase()
-            titles.filter {
-                it.title.lowercase().contains(q) ||
-                it.aliases.any { a -> a.lowercase().contains(q) } ||
-                it.sourceName.lowercase().contains(q)
+            val local = titles.filter {
+                it.title.lowercase().contains(q.lowercase()) ||
+                    it.aliases.any { a -> a.lowercase().contains(q.lowercase()) } ||
+                    it.sourceName.lowercase().contains(q.lowercase())
             }
+            // Remote hits first (dedup by URL), local matches appended.
+            (searchResults + local).distinctBy { it.url }
         }
     }
 
@@ -89,7 +102,10 @@ fun HomeScreen(
                             Text(
                                 text = "Manga Reader",
                                 fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.titleLarge
+                                style = MaterialTheme.typography.titleLarge,
+                                modifier = Modifier.pointerInput(Unit) {
+                                    detectTapGestures(onLongPress = { onOpenHiddenBrowser() })
+                                }
                             )
                         }
                     }
@@ -166,7 +182,11 @@ fun HomeScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = if (searchQuery.isNotEmpty()) "No manga found for '$searchQuery'" else "No manga available",
+                        text = when {
+                            isSearching && filteredTitles.isEmpty() -> "Searching all sources for '$searchQuery'…"
+                            searchQuery.isNotEmpty() -> "No manga found for '$searchQuery'"
+                            else -> "No manga available"
+                        },
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
