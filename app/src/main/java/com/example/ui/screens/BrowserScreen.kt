@@ -42,6 +42,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -74,7 +76,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -427,11 +431,13 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
     }
 
     // ---- Omnibox ----------------------------------------------------------------
+    val focusManager = LocalFocusManager.current
     var editingOmnibox by remember { mutableStateOf(false) }
     var omniboxText by remember(activeTabId, activeTab?.url) { mutableStateOf(activeTab?.url.orEmpty()) }
 
     fun submitOmnibox(raw: String) {
         val target = normalizeUrl(raw)
+        focusManager.clearFocus()
         editingOmnibox = false
         tabError = tabError?.takeIf { it.first != activeTabId }
         val tab = tabs.firstOrNull { it.id == activeTabId } ?: return
@@ -559,6 +565,8 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                             placeholder = { Text("Search or enter address", maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             singleLine = true,
                             textStyle = MaterialTheme.typography.bodySmall,
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                            keyboardActions = KeyboardActions(onSearch = { submitOmnibox(omniboxText) }),
                             modifier = Modifier
                                 .weight(1f)
                                 .padding(horizontal = 4.dp, vertical = 4.dp)
@@ -655,7 +663,26 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                             }
                         }.also { pullRef.value = it }
                     },
-                    update = { /* SwipeRefreshLayout gates itself via canChildScrollUp */ },
+                    update = { _ ->
+                        // Attach the active tab's WebView to the tree (and only
+                        // the active one). SwipeRefreshLayout auto-gates its
+                        // gesture via canChildScrollUp on the attached WebView.
+                        val tab = tabs.firstOrNull { it.id == activeTabId }
+                        val wv = if (tab != null && tab.url.isNotBlank()) obtainWebView(tab) else null
+                        val container = containerRef.value
+                        if (container != null) {
+                            val current = container.getChildAt(0)
+                            if (current !== wv) {
+                                (wv?.parent as? ViewGroup)?.removeView(wv) // e.g. reattach after fullscreen video
+                                container.removeAllViews()
+                                (current as? WebView)?.onPause()
+                                if (wv != null) {
+                                    container.addView(wv)
+                                    wv.onResume()
+                                }
+                            }
+                        }
+                    },
                     modifier = Modifier.fillMaxSize()
                 )
 
