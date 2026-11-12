@@ -2,14 +2,18 @@ package com.example.ui.screens
 
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.Message
-import android.view.ViewGroup
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
 import android.webkit.PermissionRequest
@@ -19,16 +23,15 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
+import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -44,16 +47,22 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FindInPage
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Tab
@@ -61,15 +70,17 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.window.Dialog
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import coil.compose.AsyncImage
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -79,16 +90,21 @@ import java.security.MessageDigest
  *
  * Not linked in the visible UI on purpose — open it by long-pressing the
  * "Manga Reader" title on the home screen (or the header of the Google Play
- * dialog).
+ * dialog). No system browser is ever invoked, so browserless devices behave
+ * identically.
  *
- * A real browser chrome, not a single WebView: multiple live tabs with a
- * switcher, a new-tab page, bookmarks, history, target=_blank into new tabs,
- * per-tab desktop mode, find-in-page, omnibox with search fallback, secure
- * indicator, downloads (system DownloadManager), file uploads, site
- * permissions, share, open-in-Chrome and error pages with retry.
+ * Chrome-grade features: live tabs with a switcher (persisted), private
+ * tabs, a new-tab page, bookmarks, history, downloads (with an in-browser
+ * list), file uploads, camera/mic/location prompts asked per site and
+ * remembered, target=_blank into new tabs, per-tab desktop mode,
+ * find-in-page, URL autocomplete from history, pull-to-refresh, Safe
+ * Browsing, real favicons, fullscreen HTML5 video, long-press link menus,
+ * clear-browsing-data, share, and Chrome-style error pages with retry.
  *
- * Sessions survive restarts: cookies live in the global CookieManager and the
- * open tabs are persisted (and reloaded) from disk.
+ * Sessions survive restarts: cookies live in the global CookieManager and
+ * open tabs are persisted (private tabs are not). The WebView User-Agent has
+ * its `; wv` / `Version/4.0` markers stripped (the DJI GO 4 trick) so Google
+ * sign-in works instead of "This browser or app may not be secure".
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("SetJavaScriptEnabled")
@@ -106,7 +122,6 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
     val activeTab = tabs.firstOrNull { it.id == activeTabId }
 
     if (activeTab == null || tabs.isEmpty()) {
-        // Nothing restorable — start fresh with one tab.
         val seed = BrowserTab(url = START_URL)
         tabs = listOf(seed)
         activeTabId = seed.id
@@ -119,28 +134,75 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
     var showTabSwitcher by remember { mutableStateOf(false) }
     var showBookmarks by remember { mutableStateOf(false) }
     var showHistory by remember { mutableStateOf(false) }
+    var showDownloads by remember { mutableStateOf(false) }
+    var showClearData by remember { mutableStateOf(false) }
     var showFindBar by remember { mutableStateOf(false) }
     var findQuery by remember { mutableStateOf("") }
     var menuOpen by remember { mutableStateOf(false) }
 
-    // ---- Bookmarks & history ---------------------------------------------------
+    // ---- Bookmarks, history cache (for autocomplete) -----------------------------
     var bookmarks by remember { mutableStateOf(BrowserStore.loadBookmarks(context)) }
+    var historyCache by remember { mutableStateOf(BrowserStore.loadHistory(context)) }
+    LaunchedEffect(activeTab?.url) { historyCache = BrowserStore.loadHistory(context) }
 
-    // ---- WebView pool (one live instance per tab) -------------------------------
-    val webViews = remember { mutableMapOf<Long, WebView>() }
-    val containerRef = remember { mutableStateOf<FrameLayout?>(null) }
+    // ---- Fullscreen video ---------------------------------------------------------
+    var customView by remember { mutableStateOf<View?>(null) }
+    var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+
+    // ---- Long-press link menu ---------------------------------------------------------
+    var linkMenu by remember { mutableStateOf<LinkMenuData?>(null) }
+    var pendingImageSrc by remember { mutableStateOf<String?>(null) }
+
+    // ---- Site permission prompts -----------------------------------------------------
+    var pendingPagePermission by remember { mutableStateOf<PermissionRequest?>(null) }
+    var pendingGeoPermission by remember { mutableStateOf<GeoPrompt?>(null) }
+    var afterRuntimePerms by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val runtimePermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val proceed = afterRuntimePerms
+        afterRuntimePerms = null
+        if (result.values.isNotEmpty() && result.values.all { it }) proceed?.invoke()
+        else pendingPagePermission?.deny().also { pendingPagePermission = null }
+        if (result.values.any { !it }) pendingPagePermission?.let { it.deny(); pendingPagePermission = null }
+    }
+    val geoPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val geo = pendingGeoPermission
+        pendingGeoPermission = null
+        geo?.callback?.invoke(geo.origin, result.values.all { it }, false)
+    }
 
     fun updateTab(id: Long, transform: (BrowserTab) -> BrowserTab) {
         tabs = tabs.map { if (it.id == id) transform(it) else it }
     }
 
-    fun openInNewTab(url: String) {
-        val tab = BrowserTab(url = url)
+    fun openInNewTab(url: String, private: Boolean = false) {
+        val tab = BrowserTab(url = url, private = private)
         tabs = tabs + tab
         tabError = null
         progress = -1
         activeTabId = tab.id
         showTabSwitcher = false
+    }
+
+    // ---- WebView pool (one live instance per tab) -------------------------------
+    val webViews = remember { mutableMapOf<Long, WebView>() }
+    val containerRef = remember { mutableStateOf<FrameLayout?>(null) }
+    val pullRef = remember { mutableStateOf<SwipeRefreshLayout?>(null) }
+
+    // Delivers the href behind a long-pressed image link (requestFocusNodeHref).
+    val focusedNodeHandler = remember {
+        Handler(Looper.getMainLooper()) { msg ->
+            val data = msg.data
+            linkMenu = LinkMenuData(
+                linkUrl = data?.getString("url")?.takeIf { it.isNotBlank() && it != "about:blank" },
+                imageUrl = data?.getString("src")?.takeIf { it.isNotBlank() } ?: pendingImageSrc
+            )
+            pendingImageSrc = null
+            true
+        }
     }
 
     fun closeTab(id: Long) {
@@ -181,7 +243,9 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                 setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                 setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
             }
-            (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val enqueued = dm.enqueue(request)
+            BrowserStore.addDownload(context, BrowserStore.DownloadEntry(enqueued, fileName, System.currentTimeMillis()))
             Toast.makeText(context, "Downloading $fileName", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(context, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
@@ -198,6 +262,27 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
             configureBrowserSettings(this, desktop = tab.desktop)
 
             setDownloadListener(downloadListener)
+
+            // Long-press: Chrome-style link/image menu. For an image that links
+            // somewhere, requestFocusNodeHref delivers the real link target.
+            setOnLongClickListener {
+                when (hitTestResult.type) {
+                    WebView.HitTestResult.SRC_ANCHOR_TYPE -> {
+                        linkMenu = LinkMenuData(linkUrl = hitTestResult.extra, imageUrl = null)
+                        true
+                    }
+                    WebView.HitTestResult.IMAGE_TYPE -> {
+                        linkMenu = LinkMenuData(linkUrl = null, imageUrl = hitTestResult.extra)
+                        true
+                    }
+                    WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE -> {
+                        pendingImageSrc = hitTestResult.extra
+                        requestFocusNodeHref(Message.obtain(focusedNodeHandler))
+                        true
+                    }
+                    else -> false
+                }
+            }
 
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -217,14 +302,14 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
 
                 override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
                     updateTab(tab.id) { it.copy(url = url) }
-                    if (!isReload && url.startsWith("http")) {
+                    if (!isReload && !tab.private && url.startsWith("http")) {
                         BrowserStore.addHistory(context, url, tab.title.ifBlank { url })
                     }
                 }
 
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                     if (request.isForMainFrame) {
-                        tabError = tab.id to (urlOf(request) to (error.description?.toString() ?: "This site can't be reached"))
+                        tabError = tab.id to (request.url.toString() to (error.description?.toString() ?: "This site can't be reached"))
                     }
                 }
 
@@ -246,12 +331,27 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                     if (tab.id == activeIdRef.longValue) {
                         progress = if (newProgress >= 100) -1 else newProgress
                     }
+                    if (newProgress >= 100) pullRef.value?.isRefreshing = false
                 }
 
                 override fun onReceivedTitle(view: WebView, title: String?) {
                     updateTab(tab.id) { it.copy(title = title.orEmpty()) }
                 }
 
+                // ---- Fullscreen HTML5 video ------------------------------------
+                override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+                    customViewCallback?.onCustomViewHidden()
+                    (view.parent as? ViewGroup)?.removeView(view)
+                    customView = view
+                    customViewCallback = callback
+                }
+
+                override fun onHideCustomView() {
+                    customView = null
+                    customViewCallback = null
+                }
+
+                // ---- File uploads (input type=file, camera, etc.) ----
                 override fun onShowFileChooser(
                     view: WebView,
                     callback: android.webkit.ValueCallback<Array<Uri>>,
@@ -268,15 +368,34 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                     return true
                 }
 
+                // ---- Site permissions: ASK, remember per site (Chrome-style) ----
                 override fun onPermissionRequest(request: PermissionRequest) {
-                    request.grant(request.resources)
+                    val origin = request.origin?.toString() ?: return request.deny()
+                    val remembered = request.resources.map { res ->
+                        origin to when (res) {
+                            PermissionRequest.RESOURCE_VIDEO_CAPTURE -> "video"
+                            PermissionRequest.RESOURCE_AUDIO_CAPTURE -> "audio"
+                            PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID -> "drm"
+                            else -> res
+                        }
+                    }
+                    val decisions = remembered.map { BrowserStore.sitePermission(context, it.first, it.second) }
+                    when {
+                        decisions.all { it == true } -> request.grant(request.resources)
+                        decisions.any { it == false } -> request.deny()
+                        else -> pendingPagePermission = request
+                    }
                 }
 
                 override fun onGeolocationPermissionsShowPrompt(
                     origin: String,
                     callback: GeolocationPermissions.Callback
                 ) {
-                    callback.invoke(origin, true, false)
+                    when (BrowserStore.sitePermission(context, origin, "geo")) {
+                        true -> callback.invoke(origin, true, false)
+                        false -> callback.invoke(origin, false, false)
+                        else -> pendingGeoPermission = GeoPrompt(origin, callback)
+                    }
                 }
 
                 // target="_blank" / window.open() opens a new tab, like Chrome.
@@ -290,7 +409,7 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                         settings.javaScriptEnabled = true
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
-                                openInNewTab(request.url.toString())
+                                openInNewTab(request.url.toString(), private = tab.private)
                                 return true
                             }
                         }
@@ -349,14 +468,22 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
         ).show()
     }
 
-    // ---- Back handling ------------------------------------------------------------
+    // ---- Back handling: video > overlays > find > menu > page > close ------------
     BackHandler {
         when {
+            customView != null -> {
+                customViewCallback?.onCustomViewHidden()
+                customView = null
+                customViewCallback = null
+            }
             showTabSwitcher -> showTabSwitcher = false
             showBookmarks -> showBookmarks = false
             showHistory -> showHistory = false
+            showDownloads -> showDownloads = false
+            showClearData -> showClearData = false
             showFindBar -> showFindBar = false
             menuOpen -> menuOpen = false
+            linkMenu != null -> linkMenu = null
             else -> {
                 val wv = webViews[activeTabId]
                 if (wv != null && wv.canGoBack()) wv.goBack() else onClose()
@@ -364,9 +491,9 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
         }
     }
 
-    // Persist tabs on every change so the browser reopens where it left off.
+    // Persist tabs on every change; private tabs never touch disk.
     LaunchedEffect(tabs, activeTabId) {
-        BrowserStore.saveTabs(context, tabs, activeTabId)
+        BrowserStore.saveTabs(context, tabs.filter { !it.private }, activeTabId.takeIf { tabs.firstOrNull { t -> t.id == it }?.private != true } ?: 0L)
     }
 
     // Destroy the pool when the browser closes.
@@ -375,6 +502,27 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
             webViews.values.forEach { it.destroy() }
             webViews.clear()
         }
+    }
+
+    // ---- Fullscreen video overlay -------------------------------------------------
+    customView?.let { videoView ->
+        DisposableEffect(videoView) {
+            onDispose {
+                (videoView.parent as? ViewGroup)?.removeView(videoView)
+            }
+        }
+        BackHandler {
+            customViewCallback?.onCustomViewHidden()
+            customView = null
+            customViewCallback = null
+        }
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            AndroidView(
+                factory = { videoView },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        return
     }
 
     // ---- UI ------------------------------------------------------------------------
@@ -390,12 +538,21 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                             .padding(horizontal = 4.dp, vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            if (activeTab?.url?.startsWith("https") == true) Icons.Default.Lock else Icons.Default.OpenInBrowser,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(start = 10.dp).size(16.dp)
-                        )
+                        if (activeTab?.private == true) {
+                            Icon(
+                                Icons.Default.Shield,
+                                contentDescription = "Private tab",
+                                tint = Color(0xFFB388FF),
+                                modifier = Modifier.padding(start = 10.dp).size(16.dp)
+                            )
+                        } else {
+                            Icon(
+                                if (activeTab?.url?.startsWith("https") == true) Icons.Default.Lock else Icons.Default.OpenInBrowser,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(start = 10.dp).size(16.dp)
+                            )
+                        }
                         OutlinedTextField(
                             value = omniboxText,
                             onValueChange = { omniboxText = it },
@@ -429,6 +586,39 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                         color = MaterialTheme.colorScheme.primary,
                         trackColor = MaterialTheme.colorScheme.surface
                     )
+
+                    // ---- Omnibox autocomplete (history + bookmarks) --------------
+                    if (editingOmnibox && omniboxText.isNotBlank()) {
+                        val q = omniboxText.trim().lowercase()
+                        val fromHistory = historyCache
+                            .filter { it.url.lowercase().contains(q) || it.title.lowercase().contains(q) }
+                            .take(4)
+                        val fromBookmarks = bookmarks
+                            .filter { it.url.lowercase().contains(q) || it.title.lowercase().contains(q) }
+                            .take(2)
+                        Column(Modifier.fillMaxWidth()) {
+                            SuggestionRow(
+                                icon = { Icon(Icons.Default.Search, null, modifier = Modifier.size(16.dp)) },
+                                primary = omniboxText.trim(),
+                                secondary = "Search Google"
+                            ) { submitOmnibox(omniboxText) }
+                            fromBookmarks.forEach { bm ->
+                                SuggestionRow(
+                                    icon = { Icon(Icons.Default.Star, null, tint = Color(0xFFFFD54F), modifier = Modifier.size(16.dp)) },
+                                    primary = bm.title.ifBlank { bm.url },
+                                    secondary = bm.url
+                                ) { submitOmnibox(bm.url) }
+                            }
+                            fromHistory.forEach { h ->
+                                SuggestionRow(
+                                    icon = { Icon(Icons.Default.History, null, modifier = Modifier.size(16.dp)) },
+                                    primary = h.title.ifBlank { h.url },
+                                    secondary = h.url
+                                ) { submitOmnibox(h.url) }
+                            }
+                        }
+                    }
+
                     if (showFindBar) {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
@@ -453,25 +643,19 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                 }
             }
 
-            // ---- Middle: the live tabs ------------------------------------------
+            // ---- Middle: pull-to-refresh wrapping the live tabs -------------------
             Box(Modifier.weight(1f)) {
                 AndroidView(
                     factory = { ctx ->
-                        FrameLayout(ctx).also { containerRef.value = it }
-                    },
-                    update = { container ->
-                        val tab = tabs.firstOrNull { it.id == activeTabId }
-                        val wv = if (tab != null && tab.url.isNotBlank()) obtainWebView(tab) else null
-                        val current = container.getChildAt(0)
-                        if (current !== wv) {
-                            container.removeAllViews()
-                            (current as? WebView)?.onPause()
-                            if (wv != null) {
-                                container.addView(wv)
-                                wv.onResume()
+                        SwipeRefreshLayout(ctx).apply {
+                            addView(FrameLayout(ctx).also { containerRef.value = it })
+                            setOnRefreshListener {
+                                tabError = tabError?.takeIf { it.first != activeIdRef.longValue }
+                                webViews[activeIdRef.longValue]?.reload()
                             }
-                        }
+                        }.also { pullRef.value = it }
                     },
+                    update = { /* SwipeRefreshLayout gates itself via canChildScrollUp */ },
                     modifier = Modifier.fillMaxSize()
                 )
 
@@ -479,6 +663,7 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                 if (activeTab != null && activeTab.url.isBlank()) {
                     StartPage(
                         bookmarks = bookmarks,
+                        private = activeTab.private,
                         onOpen = { submitOmnibox(it) },
                         onRemoveBookmark = {
                             bookmarks = BrowserStore.removeBookmark(context, it.url)
@@ -582,6 +767,14 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                     }
                 )
                 DropdownMenuItem(
+                    text = { Text("New private tab") },
+                    leadingIcon = { Icon(Icons.Default.Shield, null, tint = Color(0xFFB388FF)) },
+                    onClick = {
+                        menuOpen = false
+                        openInNewTab("", private = true)
+                    }
+                )
+                DropdownMenuItem(
                     text = { Text("Find in page") },
                     leadingIcon = { Icon(Icons.Default.FindInPage, null) },
                     onClick = {
@@ -610,7 +803,24 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                     leadingIcon = { Icon(Icons.Default.History, null) },
                     onClick = {
                         menuOpen = false
+                        historyCache = BrowserStore.loadHistory(context)
                         showHistory = true
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("Downloads") },
+                    leadingIcon = { Icon(Icons.Default.Download, null) },
+                    onClick = {
+                        menuOpen = false
+                        showDownloads = true
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("Clear browsing data") },
+                    leadingIcon = { Icon(Icons.Default.Delete, null) },
+                    onClick = {
+                        menuOpen = false
+                        showClearData = true
                     }
                 )
                 DropdownMenuItem(
@@ -649,6 +859,7 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                 },
                 onClose = { closeTab(it.id) },
                 onNewTab = { openInNewTab("") },
+                onNewPrivateTab = { openInNewTab("", private = true) },
                 onCloseAll = {
                     webViews.values.forEach { wv ->
                         (wv.parent as? ViewGroup)?.removeView(wv)
@@ -725,10 +936,11 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                     Text("History", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                     TextButton(onClick = {
                         BrowserStore.clearHistory(context)
+                        historyCache = emptyList()
                         showHistory = false
                     }) { Text("Clear all") }
                 }
-                val history = BrowserStore.loadHistory(context)
+                val history = historyCache
                 if (history.isEmpty()) {
                     Text(
                         "Nothing here yet.",
@@ -764,6 +976,366 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
                 }
             }
         }
+
+        // ---- Downloads sheet ---------------------------------------------------------
+        if (showDownloads) {
+            ModalBottomSheet(onDismissRequest = { showDownloads = false }) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Downloads", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    TextButton(onClick = {
+                        runCatching {
+                            context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        }
+                        showDownloads = false
+                    }) { Text("Open Downloads") }
+                }
+                val downloads = BrowserStore.loadDownloads(context)
+                if (downloads.isEmpty()) {
+                    Text(
+                        "Files you download from sites show up here (and in your system Downloads).",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
+                LazyColumn {
+                    items(downloads, key = { it.id }) { dl ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                    val uri = runCatching { dm.getUriForDownloadedFile(dl.id) }.getOrNull()
+                                    if (uri != null) {
+                                        runCatching {
+                                            context.startActivity(
+                                                Intent(Intent.ACTION_VIEW).apply {
+                                                    setDataAndType(uri, if (dl.mime?.startsWith("image") == true) "image/*" else dl.mime ?: "*/*")
+                                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                }
+                                            )
+                                        }
+                                    } else {
+                                        runCatching {
+                                            context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
+                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Download, null, tint = MaterialTheme.colorScheme.primary)
+                            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                                Text(dl.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    android.text.format.DateUtils.getRelativeTimeSpanString(dl.at).toString(),
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Clear browsing data sheet ----------------------------------------------------
+        if (showClearData) {
+            var clearHistory by remember { mutableStateOf(true) }
+            var clearCookies by remember { mutableStateOf(true) }
+            var clearCache by remember { mutableStateOf(true) }
+            var clearPerms by remember { mutableStateOf(false) }
+            AlertDialog(
+                onDismissRequest = { showClearData = false },
+                title = { Text("Clear browsing data") },
+                text = {
+                    Column {
+                        listOf(
+                            "Browsing history" to clearHistory,
+                            "Cookies and site data" to clearCookies,
+                            "Cached images and files" to clearCache,
+                            "Site settings (permission decisions)" to clearPerms
+                        ).forEachIndexed { i, (label, _) ->
+                            Row(
+                                Modifier.fillMaxWidth().clickable {
+                                    when (i) {
+                                        0 -> clearHistory = !clearHistory
+                                        1 -> clearCookies = !clearCookies
+                                        2 -> clearCache = !clearCache
+                                        else -> clearPerms = !clearPerms
+                                    }
+                                }.padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = when (i) {
+                                        0 -> clearHistory
+                                        1 -> clearCookies
+                                        2 -> clearCache
+                                        else -> clearPerms
+                                    },
+                                    onCheckedChange = {
+                                        when (i) {
+                                            0 -> clearHistory = it
+                                            1 -> clearCookies = it
+                                            2 -> clearCache = it
+                                            else -> clearPerms = it
+                                        }
+                                    }
+                                )
+                                Text(label, fontSize = 14.sp)
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (clearHistory) {
+                            BrowserStore.clearHistory(context)
+                            historyCache = emptyList()
+                        }
+                        if (clearCookies) {
+                            CookieManager.getInstance().removeAllCookies(null)
+                            CookieManager.getInstance().flush()
+                        }
+                        if (clearCache) {
+                            webViews.values.forEach { it.clearCache(true) }
+                            WebView(context).clearCache(true)
+                            WebStorage.getInstance().deleteAllData()
+                        }
+                        if (clearPerms) BrowserStore.clearSitePermissions(context)
+                        showClearData = false
+                        Toast.makeText(context, "Browsing data cleared", Toast.LENGTH_SHORT).show()
+                    }) { Text("Clear") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showClearData = false }) { Text("Cancel") }
+                }
+            )
+        }
+
+        // ---- Site permission prompt ------------------------------------------------------
+        pendingPagePermission?.let { request ->
+            val origin = request.origin?.host ?: "This site"
+            val wants = request.resources.mapNotNull { res ->
+                when (res) {
+                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> "camera"
+                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> "microphone"
+                    PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID -> "protected content"
+                    else -> null
+                }
+            }.filter { it != "protected content" || true }.distinct()
+            AlertDialog(
+                onDismissRequest = { request.deny(); pendingPagePermission = null },
+                title = { Text("$origin wants to use") },
+                text = { Text(if (wants.isEmpty()) "your device" else wants.joinToString(" and your ") { "your $it" }) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        pendingPagePermission = null
+                        val appPerms = request.resources.mapNotNull { res ->
+                            when (res) {
+                                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> android.Manifest.permission.CAMERA
+                                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> android.Manifest.permission.RECORD_AUDIO
+                                else -> null
+                            }
+                        }.distinct()
+                        if (appPerms.isEmpty()) {
+                            request.resources.forEach { res ->
+                                val key = when (res) {
+                                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> "video"
+                                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> "audio"
+                                    PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID -> "drm"
+                                    else -> res
+                                }
+                                BrowserStore.setSitePermission(context, request.origin.toString(), key, true)
+                            }
+                            request.grant(request.resources)
+                        } else {
+                            afterRuntimePerms = {
+                                request.resources.forEach { res ->
+                                    val key = when (res) {
+                                        PermissionRequest.RESOURCE_VIDEO_CAPTURE -> "video"
+                                        PermissionRequest.RESOURCE_AUDIO_CAPTURE -> "audio"
+                                        else -> res
+                                    }
+                                    BrowserStore.setSitePermission(context, request.origin.toString(), key, true)
+                                }
+                                request.grant(request.resources)
+                            }
+                            runtimePermLauncher.launch(appPerms.toTypedArray())
+                        }
+                    }) { Text("Allow") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        request.origin?.toString()?.let { o ->
+                            request.resources.forEach { res ->
+                                val key = when (res) {
+                                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> "video"
+                                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> "audio"
+                                    else -> res
+                                }
+                                BrowserStore.setSitePermission(context, o, key, false)
+                            }
+                        }
+                        request.deny()
+                        pendingPagePermission = null
+                    }) { Text("Don't allow") }
+                }
+            )
+        }
+
+        // ---- Geolocation prompt -------------------------------------------------------------
+        pendingGeoPermission?.let { geo ->
+            AlertDialog(
+                onDismissRequest = {
+                    geo.callback.invoke(geo.origin, false, false)
+                    pendingGeoPermission = null
+                },
+                title = { Text("${Uri.parse(geo.origin).host ?: geo.origin} wants your location") },
+                text = { Text("This site wants to use your device's location.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        pendingGeoPermission = null
+                        BrowserStore.setSitePermission(context, geo.origin, "geo", true)
+                        geoPermLauncher.launch(
+                            arrayOf(
+                                android.Manifest.permission.ACCESS_FINE_LOCATION,
+                                android.Manifest.permission.ACCESS_COARSE_LOCATION
+                            )
+                        )
+                        afterRuntimePerms = null
+                        // Grant is finished inside the launcher callback.
+                    }) { Text("Allow") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        BrowserStore.setSitePermission(context, geo.origin, "geo", false)
+                        geo.callback.invoke(geo.origin, false, false)
+                        pendingGeoPermission = null
+                    }) { Text("Don't allow") }
+                }
+            )
+        }
+
+        // ---- Long-press link/image menu --------------------------------------------------
+        linkMenu?.let { menu ->
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.4f))
+                    .clickable { linkMenu = null }
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    modifier = Modifier.align(Alignment.Center).fillMaxWidth(0.8f)
+                ) {
+                    Column(Modifier.padding(vertical = 6.dp)) {
+                        menu.linkUrl?.let { link ->
+                            MenuRow(Icons.Default.Tab, "Open link in new tab") {
+                                openInNewTab(link, private = activeTab?.private == true)
+                                linkMenu = null
+                            }
+                            MenuRow(Icons.Default.ContentCopy, "Copy link address") {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                cm.setPrimaryClip(ClipData.newPlainText("link", link))
+                                Toast.makeText(context, "Link copied", Toast.LENGTH_SHORT).show()
+                                linkMenu = null
+                            }
+                            MenuRow(Icons.Default.Share, "Share link") {
+                                context.startActivity(
+                                    Intent.createChooser(
+                                        Intent(Intent.ACTION_SEND).apply {
+                                            type = "text/plain"
+                                            putExtra(Intent.EXTRA_TEXT, link)
+                                        },
+                                        "Share link"
+                                    )
+                                )
+                                linkMenu = null
+                            }
+                        }
+                        menu.imageUrl?.let { image ->
+                            MenuRow(Icons.Default.Image, "Open image in new tab") {
+                                openInNewTab(image, private = activeTab?.private == true)
+                                linkMenu = null
+                            }
+                            MenuRow(Icons.Default.Download, "Download image") {
+                                downloadListener(image, "", "", "image/*", 0)
+                                linkMenu = null
+                            }
+                            MenuRow(Icons.Default.Share, "Share image") {
+                                context.startActivity(
+                                    Intent.createChooser(
+                                        Intent(Intent.ACTION_SEND).apply {
+                                            type = "text/plain"
+                                            putExtra(Intent.EXTRA_TEXT, image)
+                                        },
+                                        "Share image"
+                                    )
+                                )
+                                linkMenu = null
+                            }
+                        }
+                        if (menu.linkUrl == null && menu.imageUrl == null) {
+                            MenuRow(Icons.Default.Close, "Nothing here") { linkMenu = null }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private data class LinkMenuData(val linkUrl: String?, val imageUrl: String?)
+private data class GeoPrompt(val origin: String, val callback: GeolocationPermissions.Callback)
+
+@Composable
+private fun SuggestionRow(
+    icon: @Composable () -> Unit,
+    primary: String,
+    secondary: String,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        icon()
+        Column(Modifier.weight(1f).padding(start = 12.dp)) {
+            Text(primary, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                secondary,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun MenuRow(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+        Text(label, Modifier.padding(start = 14.dp), fontSize = 15.sp)
     }
 }
 
@@ -774,6 +1346,7 @@ fun BrowserScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
 @Composable
 private fun StartPage(
     bookmarks: List<BrowserStore.Bookmark>,
+    private: Boolean,
     onOpen: (String) -> Unit,
     onRemoveBookmark: (BrowserStore.Bookmark) -> Unit
 ) {
@@ -784,12 +1357,21 @@ private fun StartPage(
             .statusBarsPadding()
             .padding(16.dp)
     ) {
-        Text(
-            "Chromium",
-            fontWeight = FontWeight.Bold,
-            fontSize = 22.sp,
-            modifier = Modifier.padding(vertical = 12.dp)
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (private) "Private tab" else "Chromium",
+                fontWeight = FontWeight.Bold,
+                fontSize = 22.sp,
+                modifier = Modifier.weight(1f)
+            )
+            if (private) {
+                Text(
+                    "Nothing from this tab is saved",
+                    color = Color(0xFFB388FF),
+                    fontSize = 12.sp
+                )
+            }
+        }
         Text(
             "Quick links",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -856,6 +1438,7 @@ private fun TabSwitcher(
     onSelect: (BrowserTab) -> Unit,
     onClose: (BrowserTab) -> Unit,
     onNewTab: () -> Unit,
+    onNewPrivateTab: () -> Unit,
     onCloseAll: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -884,6 +1467,13 @@ private fun TabSwitcher(
                     modifier = Modifier.weight(1f)
                 )
                 TextButton(onClick = onCloseAll) { Text("Close all") }
+                IconButton(onClick = onNewPrivateTab) {
+                    Icon(
+                        Icons.Default.Shield,
+                        "New private tab",
+                        tint = Color(0xFFB388FF)
+                    )
+                }
                 FilledTonalButton(onClick = onNewTab) {
                     Icon(Icons.Default.Add, null)
                     Spacer(Modifier.width(4.dp))
@@ -911,9 +1501,18 @@ private fun TabSwitcher(
                             Modifier.fillMaxWidth().padding(8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Favicon(tab.url)
+                            if (tab.private) {
+                                Icon(
+                                    Icons.Default.Shield,
+                                    null,
+                                    tint = Color(0xFFB388FF),
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            } else {
+                                Favicon(tab.url)
+                            }
                             Text(
-                                tab.title.ifBlank { tab.url.ifBlank { "New tab" } },
+                                tab.title.ifBlank { tab.url.ifBlank { if (tab.private) "Private tab" else "New tab" } },
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 fontSize = 12.sp,
@@ -930,12 +1529,16 @@ private fun TabSwitcher(
                                 .background(MaterialTheme.colorScheme.background),
                             contentAlignment = Alignment.Center
                         ) {
-                            Text(
-                                tab.url.toDomain().ifBlank { "New tab" },
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 13.sp,
-                                maxLines = 2
-                            )
+                            if (tab.private) {
+                                Icon(Icons.Default.Shield, null, tint = Color(0xFFB388FF).copy(alpha = 0.5f))
+                            } else {
+                                Text(
+                                    tab.url.toDomain().ifBlank { "New tab" },
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = 13.sp,
+                                    maxLines = 2
+                                )
+                            }
                         }
                     }
                 }
@@ -944,19 +1547,15 @@ private fun TabSwitcher(
     }
 }
 
-/** Letter-avatar favicon (WebViews don't expose favicons reliably). */
+/** Real favicon from Google's favicon service; letter avatar behind it as fallback. */
 @Composable
 private fun Favicon(url: String) {
     val domain = url.toDomain()
-    val hue = remember(domain) {
-        if (domain.isEmpty()) 0f
-        else (MessageDigest.getInstance("MD5").digest(domain.toByteArray()).first().toInt() and 0xFF) / 255f * 360f
-    }
     Box(
         Modifier
             .size(24.dp)
             .background(
-                Color.hsv(hue, 0.55f, 0.85f).copy(alpha = 0.9f),
+                letterColor(domain),
                 CircleShape
             ),
         contentAlignment = Alignment.Center
@@ -967,37 +1566,54 @@ private fun Favicon(url: String) {
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold
         )
+        if (domain.isNotBlank()) {
+            AsyncImage(
+                model = "https://www.google.com/s2/favicons?domain=$domain&sz=64",
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
     }
 }
 
-private fun urlOf(request: WebResourceRequest): String = request.url.toString()
+private fun letterColor(domain: String): Color {
+    if (domain.isEmpty()) return Color(0xFF546E7A)
+    val h = (MessageDigest.getInstance("MD5").digest(domain.toByteArray()).first().toInt() and 0xFF) / 255f * 360f
+    return Color.hsv(h, 0.55f, 0.85f).copy(alpha = 0.9f)
+}
 
 private fun String.toDomain(): String =
     runCatching { Uri.parse(this).host?.removePrefix("www.").orEmpty() }.getOrDefault("")
 
 // ----------------------------------------------------------------------------------
-// Tab model + persistence (tabs, bookmarks, history)
+// Tab model + persistence (tabs, bookmarks, history, downloads, site permissions)
 // ----------------------------------------------------------------------------------
 
 data class BrowserTab(
     val id: Long = System.nanoTime(),
     val url: String,          // blank = new-tab start page
     val title: String = "",
-    val desktop: Boolean = false
+    val desktop: Boolean = false,
+    val private: Boolean = false
 )
 
 object BrowserStore {
     data class Bookmark(val url: String, val title: String)
     data class HistoryEntry(val url: String, val title: String, val at: Long)
+    data class DownloadEntry(val id: Long, val name: String, val at: Long, val mime: String? = null)
 
     private const val PREFS = "browser_prefs"
     private const val TABS = "tabs"
     private const val ACTIVE = "active"
     private const val BOOKMARKS = "bookmarks"
     private const val HISTORY = "history"
+    private const val DOWNLOADS = "downloads"
+    private const val SITE_PERMS = "site_perms"
     private const val HISTORY_MAX = 300
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    // ---- Tabs (private tabs are never persisted) ----
 
     fun loadTabs(context: Context): List<BrowserTab> = runCatching {
         val arr = JSONArray(prefs(context).getString(TABS, "[]"))
@@ -1014,7 +1630,7 @@ object BrowserStore {
 
     fun saveTabs(context: Context, tabs: List<BrowserTab>, activeId: Long) {
         val arr = JSONArray()
-        for (t in tabs) {
+        for (t in tabs.filter { !it.private }) {
             arr.put(
                 JSONObject()
                     .put("id", t.id)
@@ -1030,6 +1646,8 @@ object BrowserStore {
     }
 
     fun loadActiveTab(context: Context): Long = prefs(context).getLong(ACTIVE, 0L)
+
+    // ---- Bookmarks ----
 
     fun loadBookmarks(context: Context): List<Bookmark> = runCatching {
         val arr = JSONArray(prefs(context).getString(BOOKMARKS, "[]"))
@@ -1058,6 +1676,8 @@ object BrowserStore {
         prefs(context).edit().putString(BOOKMARKS, arr.toString()).apply()
     }
 
+    // ---- History ----
+
     fun loadHistory(context: Context): List<HistoryEntry> = runCatching {
         val arr = JSONArray(prefs(context).getString(HISTORY, "[]"))
         (0 until arr.length()).mapNotNull { i ->
@@ -1078,6 +1698,54 @@ object BrowserStore {
 
     fun clearHistory(context: Context) {
         prefs(context).edit().remove(HISTORY).apply()
+    }
+
+    // ---- Downloads ----
+
+    fun loadDownloads(context: Context): List<DownloadEntry> = runCatching {
+        val arr = JSONArray(prefs(context).getString(DOWNLOADS, "[]"))
+        (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            DownloadEntry(
+                id = o.getLong("id"),
+                name = o.getString("name"),
+                at = o.optLong("at", 0L),
+                mime = o.optString("mime", null)
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    fun addDownload(context: Context, entry: DownloadEntry) {
+        val updated = (listOf(entry) + loadDownloads(context)).take(100)
+        val arr = JSONArray()
+        for (d in updated) {
+            arr.put(
+                JSONObject()
+                    .put("id", d.id)
+                    .put("name", d.name)
+                    .put("at", d.at)
+                    .put("mime", d.mime ?: "")
+            )
+        }
+        prefs(context).edit().putString(DOWNLOADS, arr.toString()).apply()
+    }
+
+    // ---- Per-site permission decisions (origin -> {video/audio/geo/drm: allowed}) ----
+
+    fun sitePermission(context: Context, origin: String, key: String): Boolean? = runCatching {
+        JSONObject(prefs(context).getString(SITE_PERMS, "{}"))
+            .optJSONObject(origin)?.optBoolean(key) // null when unset
+    }.getOrNull()
+
+    fun setSitePermission(context: Context, origin: String, key: String, allowed: Boolean) {
+        val root = runCatching { JSONObject(prefs(context).getString(SITE_PERMS, "{}")) }.getOrDefault(JSONObject())
+        val site = root.optJSONObject(origin) ?: JSONObject().also { root.put(origin, it) }
+        site.put(key, allowed)
+        prefs(context).edit().putString(SITE_PERMS, root.toString()).apply()
+    }
+
+    fun clearSitePermissions(context: Context) {
+        prefs(context).edit().remove(SITE_PERMS).apply()
     }
 }
 
@@ -1115,6 +1783,7 @@ private fun configureBrowserSettings(webView: WebView, desktop: Boolean) {
         setSupportZoom(true)
         cacheMode = WebSettings.LOAD_DEFAULT
         mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        safeBrowsingEnabled = true // malware/phishing interstitials
         userAgentString = if (desktop) {
             DESKTOP_UA
         } else {
