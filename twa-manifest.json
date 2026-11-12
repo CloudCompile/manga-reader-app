@@ -1,0 +1,31 @@
+{
+  "packageId": "com.aistudio.mangareader.qrxvwt",
+  "host": "ais-dev-zcqbz5c27kmw3ydslovghv-484637397614.us-east1.run.app",
+  "name": "Manga Reader",
+  "launcherName": "MangaReader",
+  "themeColor": "#0a0a0a",
+  "navigationColor": "#0a0a0a",
+  "backgroundColor": "#0a0a0a",
+  "enableNotifications": false,
+  "startUrl": "/",
+  "iconUrl": "/icon.svg",
+  "maskableIconUrl": "/icon-maskable.svg",
+  "appVersionCode": 1,
+  "appVersionName": "1.0.0",
+  "minSdkVersion": 26,
+  "targetSdkVersion": 36,
+  "orientation": "any",
+  "display": "standalone",
+  "features": {
+    "playBilling": {
+      "enabled": false
+    }
+  },
+  "alphaDependencies": {
+    "enabled": false
+  },
+  "signingKey": {
+    "path": "./android.keystore",
+    "alias": "mangareader"
+  }
+}

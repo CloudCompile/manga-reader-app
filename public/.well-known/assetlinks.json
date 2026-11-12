@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.aistudio.mangareader.qrxvwt",
+      "sha256_cert_fingerprints": [
+        "14:6D:E9:7F:0F:7B:A8:17:80:60:DF:99:93:26:FA:54:E9:9D:C4:F3:A8:32:0C:69:B6:3B:56:56:4C:E6:9E:04"
+      ]
+    }
+  }
+]

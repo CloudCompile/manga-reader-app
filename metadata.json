@@ -1,0 +1,6 @@
+{
+  "name": "Manga Reader",
+  "description": "Ad-free manga reader featuring curated titles, reading history, and reader modes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
