@@ -20,10 +20,10 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file("${rootDir}/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            storeFile = file("${rootDir}/manga-reader-release.keystore")
+            storePassword = "Ij1Ah3NX9HpSMoeTUbEnox"
+            keyAlias = "mangareader-upload"
+            keyPassword = "Ij1Ah3NX9HpSMoeTUbEnox"
         }
         getByName("debug") {
             storeFile = file("${rootDir}/debug.keystore")
